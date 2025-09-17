@@ -3,6 +3,7 @@ import os
 from pathlib import PosixPath
 from typing import Optional, Tuple
 
+from compressed_tensors.utils import remove_dispatch
 from loguru import logger
 from torch.nn import Module
 from transformers import (
@@ -14,12 +15,17 @@ from transformers import (
 )
 from transformers.utils.quantization_config import CompressedTensorsConfig
 
-from llmcompressor.args import ModelArguments, RecipeArguments, TrainingArguments
+from llmcompressor.args import (
+    DatasetArguments,
+    ModelArguments,
+    RecipeArguments,
+    TrainingArguments,
+)
 from llmcompressor.core import reset_session
-from llmcompressor.pytorch.model_load.helpers import fallback_to_cpu, parse_dtype
-from llmcompressor.transformers.sparsification.compressed_tensors_utils import (
+from llmcompressor.pytorch.model_load.helpers import parse_dtype
+from llmcompressor.transformers.compression.compressed_tensors_utils import (
     modify_save_pretrained,
-    patch_tied_tensors_bug,
+    untie_word_embeddings,
 )
 from llmcompressor.transformers.utils.helpers import (
     detect_last_checkpoint,
@@ -29,7 +35,11 @@ from llmcompressor.typing import Processor
 from llmcompressor.utils.fsdp.helpers import is_fsdp_model
 
 
-def pre_process(model_args: "ModelArguments"):
+def pre_process(
+    model_args: ModelArguments,
+    dataset_args: DatasetArguments,
+    output_dir: Optional[str],
+):
     """
     Prepares the model and tokenizer/processor for calibration.
     - Initializes the model if it's specified as a path or string.
@@ -53,14 +63,31 @@ def pre_process(model_args: "ModelArguments"):
         model_args.model = model
         model_args.distill_teacher = distill_teacher
 
-    # Initialize processor
+    # Initialize processor if dataset provided
     if isinstance(model_args.processor, (str, type(None))):
-        model_args.processor = initialize_processor_from_path(
-            model_args, model_args.model
-        )
+        try:
+            model_args.processor = initialize_processor_from_path(
+                model_args, model_args.model
+            )
+        except Exception as e:
+            if dataset_args.is_dataset_provided():
+                raise RuntimeError(
+                    "An error occurred when attempting to initialize "
+                    "model processor, which is required when a dataset "
+                    "is provided. To resolve, create and pass in a "
+                    "processor directly to `oneshot`/`train`."
+                ) from e
+            elif output_dir:
+                logger.warning(
+                    "Model processor could not be auto-initialized and "
+                    "will not be saved along with the model. To resolve, "
+                    "create and pass in a processor directly to "
+                    f"`oneshot`/`train`.\nInitialization Error: {e}"
+                )
 
     # untie tie_word_embeddings weights
-    patch_tied_tensors_bug(model_args.model)
+    if not model_args.tie_word_embeddings:
+        untie_word_embeddings(model_args.model)
 
     # wrap model.save_pretrained
     modify_save_pretrained(model_args.model)
@@ -84,12 +111,17 @@ def post_process(
     Raises:
         ValueError: If saving fails due to an invalid `output_dir` or other issues.
     """
+    # remove any existing dispatches
+    if model_args is not None and model_args.model is not None:
+        remove_dispatch(model_args.model)
+
     if model_args is not None and output_dir is not None:
         if recipe_args is not None and getattr(recipe_args, "stage", None) is not None:
             output_dir = os.path.join(output_dir, recipe_args.stage)
             os.makedirs(output_dir, exist_ok=True)
             logger.info(f"[Save] Stage detected. Updating output_dir to {output_dir}")
 
+        # TODO: support general saving parameters, beyond save_compressed
         model_args.model.save_pretrained(
             output_dir, save_compressed=model_args.save_compressed
         )
@@ -99,9 +131,9 @@ def post_process(
 
     else:
         logger.warning(
-            "Optimized model is not saved. To save, please provide",
-            "`output_dir` as input arg.",
-            "Ex. `oneshot(..., output_dir=...)`",
+            "Optimized model is not saved. To save, please provide"
+            "`output_dir` as input arg."
+            "Ex. `oneshot(..., output_dir=...)`"
         )
 
     # Reset the one-time-use session upon completion
@@ -137,7 +169,6 @@ def initialize_model_from_path(
         cache_dir=model_args.cache_dir,
         revision=model_args.model_revision,
         use_auth_token=True if model_args.use_auth_token else None,
-        tie_word_embeddings=model_args.tie_word_embeddings,
         trust_remote_code=model_args.trust_remote_code_model,
     )
 
@@ -150,7 +181,6 @@ def initialize_model_from_path(
             AutoConfig.from_pretrained(
                 model_args.distill_teacher,
                 use_auth_token=True if model_args.use_auth_token else None,
-                tie_word_embeddings=model_args.tie_word_embeddings,
                 trust_remote_code=model_args.trust_remote_code_model,
             )
             if model_args.distill_teacher
@@ -192,20 +222,12 @@ def initialize_model_from_path(
         else model_args.model_name_or_path
     )
 
-    # Fallback to CPU if GPU requested and not available
-    model_args.oneshot_device = fallback_to_cpu(model_args.oneshot_device)
-
-    device_map = model_args.oneshot_device
-    if training_args is not None and training_args.do_train:
-        device_map = "auto"
-
     model_kwargs = {
         "config": config,
         "cache_dir": model_args.cache_dir,
         "revision": model_args.model_revision,
         "use_auth_token": True if model_args.use_auth_token else None,
         "torch_dtype": parse_dtype(model_args.precision),
-        "device_map": device_map,
         "trust_remote_code": model_args.trust_remote_code_model,
     }
 
@@ -215,10 +237,7 @@ def initialize_model_from_path(
             run_compressed=False
         )
 
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        **model_kwargs,
-    )
+    model = AutoModelForCausalLM.from_pretrained(model_path, **model_kwargs)
     if "sequence_length" in model_kwargs:
         model.seqlen = model_kwargs["sequence_length"]
 
@@ -246,7 +265,7 @@ def initialize_processor_from_path(
         )
 
     except ValueError as exception:
-        if "trust_remote_code=True" in exception.value:
+        if any("trust_remote_code=True" in arg for arg in exception.args):
             raise ValueError(
                 f"The repository for {processor_src} contains custom code which must "
                 "be executed to correctly load the tokenizer/processor. You can "

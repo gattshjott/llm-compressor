@@ -61,11 +61,12 @@ __all__ = [
     "is_package_available",
     "import_from_path",
     "getattr_chain",
-    "DisableKVCache",
+    "disable_cache",
     "DisableQuantization",
     "eval_context",
     "calibration_forward_context",
-    "preserve_attr",
+    "patch_attr",
+    "disable_hf_kernels",
 ]
 
 
@@ -973,7 +974,8 @@ def getattr_chain(obj: Any, chain_str: str, *args, **kwargs) -> Any:
     return res
 
 
-class DisableKVCache:
+@contextlib.contextmanager
+def disable_cache(module: torch.nn.Module):
     """
     Temporarily disable the key-value cache for transformer models. Used to prevent
     excess memory use in one-shot cases where the model only performs the prefill
@@ -982,32 +984,18 @@ class DisableKVCache:
     Example:
     >>> model = AutoModel.from_pretrained("TinyLlama/TinyLlama-1.1B-Chat-v1.0")
     >>> input = torch.randint(0, 32, size=(1, 32))
-    >>> with DisableKVCache(model):
+    >>> with disable_cache(model):
     ...     output = model(input)
     """
 
-    def __init__(self, model: PreTrainedModel):
-        if hasattr(model.config, "use_cache"):
-            self.config = model.config
+    if isinstance(module, PreTrainedModel):
+        config = module.config
+        config = getattr(config, "text_config", config)
+        with patch_attr(config, "use_cache", False):
+            yield
 
-        # MllamaConfig
-        elif hasattr(model.config, "text_config") and hasattr(
-            model.config.text_config, "use_cache"
-        ):
-            self.config = model.config.text_config
-
-        # unknown config structure
-        else:
-            raise NotImplementedError(f"Cannot find `use_cache` for {model.config}")
-
-        self.restore_value = self.config.use_cache
-
-    def __enter__(self):
-        self.restore_value = self.config.use_cache
-        self.config.use_cache = False
-
-    def __exit__(self, _exc_type, _exc_val, _exc_tb):
-        self.config.use_cache = self.restore_value
+    else:
+        yield
 
 
 @contextlib.contextmanager
@@ -1024,6 +1012,9 @@ def DisableQuantization(module: torch.nn.Module):
 
 @contextlib.contextmanager
 def eval_context(module: torch.nn.Module):
+    """
+    Disable pytorch training mode for the given module
+    """
     restore_value = module.training
     try:
         module.train(False)  # equivalent to eval()
@@ -1034,26 +1025,60 @@ def eval_context(module: torch.nn.Module):
 
 
 @contextlib.contextmanager
-def calibration_forward_context(model: PreTrainedModel):
+def disable_hf_kernels(module: torch.nn.Module):
+    """
+    In transformers>=4.50.0, some module forward methods may be
+    replaced by calls to hf hub kernels. This has the potential
+    to bypass hooks added by LLM Compressor
+    """
+    if isinstance(module, PreTrainedModel):
+        with patch_attr(module.config, "disable_custom_kernels", True):
+            yield
+
+    else:
+        yield
+
+
+@contextlib.contextmanager
+def calibration_forward_context(model: torch.nn.Module):
     """
     Context in which all calibration forward passes should occur.
 
     - Remove gradient calculations
     - Disable the KV cache
     - Disable train mode and enable eval mode
+    - Disable hf kernels which could bypass hooks
     """
-    with (
-        torch.no_grad(),
-        DisableKVCache(model),
-        eval_context(model),
+    with torch.no_grad(), disable_cache(model), eval_context(model), disable_hf_kernels(
+        model
     ):
         yield
 
 
 @contextlib.contextmanager
-def preserve_attr(base: object, attr: str):
-    value = getattr(base, attr)
+def patch_attr(base: object, attr: str, value: Any):
+    """
+    Patch the value of an object attribute. Original value is restored upon exit
+
+    :param base: object which has the attribute to patch
+    :param attr: name of the the attribute to patch
+    :param value: used to replace original value
+
+    Usage:
+    >>> from types import SimpleNamespace
+    >>> obj = SimpleNamespace()
+    >>> with patch_attr(obj, "attribute", "value"):
+    ...     assert obj.attribute == "value"
+    >>> assert not hasattr(obj, "attribute")
+    """
+    _sentinel = object()
+    original_value = getattr(base, attr, _sentinel)
+
+    setattr(base, attr, value)
     try:
         yield
     finally:
-        setattr(base, attr, value)
+        if original_value is not _sentinel:
+            setattr(base, attr, original_value)
+        else:
+            delattr(base, attr)

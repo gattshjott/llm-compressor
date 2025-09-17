@@ -11,12 +11,6 @@ from tests.examples.utils import (
     requires_gpu_count,
 )
 
-# flash_attn module is required. It cannot safely be specified as a dependency because
-# it rqeuires a number of non-standard packages to be installed in order to be built
-# such as pytorch, and thus cannot be installed in a clean environment (those
-# dependencies must be installed prior to attempting to install flash_attn)
-pytest.importorskip("flash_attn", reason="flash_attn is required")
-
 
 @pytest.fixture
 def example_dir() -> str:
@@ -50,14 +44,11 @@ class TestQuantizingMOE:
         "script_filename",
         [
             pytest.param(
-                "deepseek_moe_w4a16.py",
-                marks=[
-                    pytest.mark.multi_gpu,
-                    pytest.mark.skip(reason="exceptionally long run time"),
-                ],
+                "deepseek_r1_example.py",
+                marks=pytest.mark.skip(reason="exceptionally long run time"),
             ),
-            pytest.param("deepseek_moe_w8a8_fp8.py"),
-            pytest.param("deepseek_moe_w8a8_int8.py", marks=pytest.mark.multi_gpu),
+            pytest.param("mixtral_example.py"),
+            pytest.param("qwen_example.py"),
         ],
     )
     def test_deepseek_example_script(

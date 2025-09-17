@@ -2,27 +2,32 @@ from math import ceil
 from typing import Any, Iterable, Optional, Tuple, Union
 
 import torch
+from compressed_tensors import InternalModule
 from compressed_tensors.quantization.quant_args import (
+    FP8_E4M3_DATA,
     QuantizationArgs,
     QuantizationStrategy,
 )
+from compressed_tensors.quantization.utils import is_fp4
 from compressed_tensors.registry.registry import RegistryMixin
 from compressed_tensors.utils import safe_permute
 from loguru import logger
 from torch import FloatTensor, IntTensor, Tensor
-from torch.nn import Module
 
 __all__ = ["Observer"]
 
 
-class Observer(Module, RegistryMixin):
+class Observer(InternalModule, RegistryMixin):
     """
     Base Observer class to be subclassed for specific implementation.
     Subclasses should override `calculate_qparams` to return a scale, zero_point
     pair
     """
 
-    def __init__(self, quantization_args: QuantizationArgs):
+    def __init__(
+        self,
+        quantization_args: QuantizationArgs,
+    ):
         self.quantization_args: QuantizationArgs = quantization_args
         super().__init__()
         self._scale = None
@@ -31,41 +36,82 @@ class Observer(Module, RegistryMixin):
 
     @torch.no_grad()
     def forward(
-        self, observed: Tensor, g_idx: Optional[Tensor] = None
+        self,
+        observed: Tensor,
+        g_idx: Optional[Tensor] = None,
+        global_scale: Optional[Tensor] = None,
+        should_calculate_gparam: bool = False,
     ) -> Tuple[FloatTensor, IntTensor]:
         """
         maps directly to get_qparams
         :param observed: optional observed tensor from which to calculate
             quantization parameters
         :param g_idx: optional mapping from column index to group index
+        :param global_scale: optional scale to further scale local quantization scales
         :return: tuple of scale and zero point based on last observed value
         """
         self.record_observed_tokens(observed)
-        return self.get_qparams(observed=observed, g_idx=g_idx)
+        if should_calculate_gparam:
+            return self.get_gparam(observed=observed)
+        return self.get_qparams(
+            observed=observed,
+            g_idx=g_idx,
+            global_scale=global_scale,
+        )
 
     def calculate_qparams(
         self,
         observed: Tensor,
         reduce_dims: Optional[Tuple[int]] = None,
+        tensor_id: Optional[Any] = None,
+        global_scale: Optional[Tensor] = None,
     ) -> Tuple[FloatTensor, IntTensor]:
         """
         :param observed: observed tensor to calculate quantization parameters for
         :param reduce_dims: optional tuple of dimensions to reduce along,
             returned scale and zero point will be shaped (1,) along the
             reduced dimensions
+        :param tensor_id: optional id for tracking separate statistics when different
+            ranges of observed tensors are passed, useful for sharding tensors by
+            group_size or block quantization
+        :param global_scale: optional scale to further scale local quantization scales
         :return: tuple of scale and zero point derived from the observed tensor
         """
         raise NotImplementedError(f"{self.__class__} must implement calculate_qparams")
+
+    def calculate_gparam(
+        self,
+        observed: Tensor,
+    ) -> torch.Tensor:
+        """
+        :param observed: observed tensor to calculate quantization parameters for
+        :return: global scale derived from the observed tensor
+        """
+        raise NotImplementedError(f"{self.__class__} must implement calculate_gparam")
 
     def post_calculate_qparams(self) -> None:
         """
         Run any logic specific to its observers after running calculate_qparams
         """
 
+    def get_gparam(self, observed: Tensor):
+        """
+        Function to derive a global scale parameter
+        :param observed: observed tensor to calculate global parameters
+            from
+        :return: derived global scale
+        """
+        if self.quantization_args.strategy == QuantizationStrategy.TENSOR_GROUP:
+            return self.calculate_gparam(observed)
+        raise NotImplementedError(
+            "global parameter generation is only supported for TENSOR_GROUP"
+        )
+
     def get_qparams(
         self,
         observed: Optional[Tensor] = None,
         g_idx: Optional[Tensor] = None,
+        global_scale: Optional[Tensor] = None,
     ) -> Tuple[FloatTensor, IntTensor]:
         """
         Convenience function to wrap overwritten calculate_qparams
@@ -75,6 +121,7 @@ class Observer(Module, RegistryMixin):
         :param observed: optional observed tensor to calculate quantization parameters
             from
         :param g_idx: optional mapping from column index to group index
+        :param global_scale: optional scale to further scale local quantization scales
         :return: tuple of scale and zero point based on last observed value
         """
         if observed is not None:
@@ -84,14 +131,30 @@ class Observer(Module, RegistryMixin):
                 # re-calculate scale and zero point, update the stored value
                 self._scale, self._zero_point = self.calculate_qparams(observed)
 
-            elif self.quantization_args.strategy == QuantizationStrategy.GROUP:
+            elif self.quantization_args.strategy in (
+                QuantizationStrategy.TENSOR_GROUP,
+                QuantizationStrategy.GROUP,
+            ):
                 rows = observed.shape[0]
                 columns = observed.shape[1]
                 num_groups = int(ceil(columns / group_size))
+                if num_groups * group_size != columns:
+                    logger.bind(log_once=True).warning(
+                        "Attempting to quantize a module weight whose columns "
+                        f"({columns}) are not divisible by group_size ({group_size}). "
+                        "This scheme is not supported by vLLM, please consider "
+                        "adjusting the group_size for modules with this number of "
+                        "columns",
+                    )
+
                 self._scale = torch.empty(
                     (rows, num_groups), dtype=observed.dtype, device=observed.device
                 )
-                zp_dtype = self.quantization_args.pytorch_dtype()
+                if is_fp4(quantization_args=self.quantization_args):
+                    zp_dtype = FP8_E4M3_DATA.dtype
+                else:
+                    zp_dtype = self.quantization_args.pytorch_dtype()
+
                 self._zero_point = torch.empty(
                     (rows, num_groups), dtype=zp_dtype, device=observed.device
                 )
@@ -117,6 +180,7 @@ class Observer(Module, RegistryMixin):
                         observed[:, start:end],
                         0,
                         tensor_id=group_index,
+                        global_scale=global_scale,
                     )
 
                     self._scale[:, group_index] = scale.squeeze(1)
@@ -134,6 +198,57 @@ class Observer(Module, RegistryMixin):
                     dim={0, 1},
                 )
 
+            elif self.quantization_args.strategy == QuantizationStrategy.BLOCK:
+                # Block-wise quantization: one scale/zero_point per block of shape
+                # [block_rows, block_cols]
+                rows, cols = observed.shape[:2]
+                bs = self.quantization_args.block_structure
+                if not (
+                    isinstance(bs, (list, tuple))
+                    and len(bs) == 2
+                    and all(isinstance(x, int) for x in bs)
+                ):
+                    raise ValueError(
+                        f"Invalid block_structure '{bs}'. "
+                        f"Must be a list of two ints [rows, cols]."
+                    )
+                block_rows, block_cols = bs
+                num_br = int(ceil(rows / block_rows))
+                num_bc = int(ceil(cols / block_cols))
+
+                # allocate per-block scale and zero_point
+                self._scale = torch.empty(
+                    (num_br, num_bc), dtype=observed.dtype, device=observed.device
+                )
+
+                # Use same dtype logic as GROUP strategy for zero_point
+                if is_fp4(quantization_args=self.quantization_args):
+                    zp_dtype = FP8_E4M3_DATA.dtype
+                else:
+                    zp_dtype = self.quantization_args.pytorch_dtype()
+
+                self._zero_point = torch.empty(
+                    (num_br, num_bc), dtype=zp_dtype, device=observed.device
+                )
+
+                # compute qparams for each block
+                for i in range(num_br):
+                    r0 = i * block_rows
+                    r1 = min((i + 1) * block_rows, rows)
+                    for j in range(num_bc):
+                        c0 = j * block_cols
+                        c1 = min((j + 1) * block_cols, cols)
+                        # reduce across both dims to get one scale and zp per block
+                        # Use unique tensor_id for each block to maintain separate stats
+                        block_tensor_id = f"block_{i}_{j}"
+                        scale_bp, zp_bp = self.calculate_qparams(
+                            observed[r0:r1, c0:c1],
+                            reduce_dims=(0, 1),
+                            tensor_id=block_tensor_id,
+                        )
+                        self._scale[i, j] = scale_bp
+                        self._zero_point[i, j] = zp_bp
+
         return self._scale, self._zero_point
 
     def get_qparams_along_dim(
@@ -141,6 +256,7 @@ class Observer(Module, RegistryMixin):
         observed,
         dim: Union[int, Iterable[int]],
         tensor_id: Optional[Any] = None,
+        global_scale: Optional[Tensor] = None,
     ):
         if isinstance(dim, int):
             dim = [dim]
@@ -148,7 +264,10 @@ class Observer(Module, RegistryMixin):
 
         reduce_dims = tuple(idx for idx in range(observed.ndim) if idx not in dim)
         return self.calculate_qparams(
-            observed, reduce_dims=reduce_dims, tensor_id=tensor_id
+            observed,
+            reduce_dims=reduce_dims,
+            tensor_id=tensor_id,
+            global_scale=global_scale,
         )
 
     def record_observed_tokens(self, batch_tensor: Tensor):

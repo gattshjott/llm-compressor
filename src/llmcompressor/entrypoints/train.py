@@ -8,6 +8,7 @@ from llmcompressor.args import parse_args
 from llmcompressor.core.session_functions import active_session
 from llmcompressor.datasets.utils import get_processed_dataset
 from llmcompressor.transformers.finetune.trainer import Trainer
+from llmcompressor.utils.dev import dispatch_for_generation
 
 from .utils import post_process, pre_process
 
@@ -58,11 +59,12 @@ def train(**kwargs) -> PreTrainedModel:
         ```
 
     """
-    model_args, dataset_args, recipe_args, training_args, _ = parse_args(
+    model_args, dataset_args, recipe_args, training_args, output_dir = parse_args(
         include_training_args=True, **kwargs
     )
 
-    pre_process(model_args)
+    pre_process(model_args, dataset_args, output_dir)
+    dispatch_for_generation(model_args.model)  # train is dispatched same as generation
 
     processed_dataset = get_processed_dataset(
         dataset_args=dataset_args,
@@ -116,7 +118,10 @@ def train(**kwargs) -> PreTrainedModel:
     trainer.save_metrics("train", metrics)
 
     # this includes saving the state, optimizer and scheduler
-    trainer.save_model(output_dir=training_args.output_dir)
+    # TODO: support all save args, not just skip_sparsity_compression_stats
+    trainer.save_model(
+        output_dir=training_args.output_dir, skip_sparsity_compression_stats=False
+    )
 
     post_process(recipe_args=recipe_args)
     training_args.output_dir = original_output_dir

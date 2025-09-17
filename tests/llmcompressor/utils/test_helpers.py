@@ -2,19 +2,30 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from transformers import (
+    AutoModelForCausalLM,
+    MllamaForConditionalGeneration,
+    PretrainedConfig,
+    PreTrainedModel,
+)
 
 from llmcompressor.utils import (
     ALL_TOKEN,
     DisableQuantization,
     calibration_forward_context,
     convert_to_bool,
+    disable_cache,
     flatten_iterable,
     getattr_chain,
     interpolate,
+    patch_attr,
     validate_str_iterable,
 )
+from llmcompressor.utils.dev import skip_weights_download
+from tests.testing_utils import requires_gpu
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "test_list,output",
     [
@@ -29,6 +40,7 @@ def test_flatten_iterable(test_list, output):
     assert flattened == output
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "test_bool,output",
     [
@@ -53,6 +65,7 @@ def test_convert_to_bool(test_bool, output):
     assert converted == output
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "test_list,output",
     [
@@ -68,11 +81,13 @@ def test_validate_str_iterable(test_list, output):
     assert validated == output
 
 
+@pytest.mark.unit
 def test_validate_str_iterable_negative():
     with pytest.raises(ValueError):
         validate_str_iterable("will fail", "")
 
 
+@pytest.mark.unit
 @pytest.mark.parametrize(
     "x_cur,x0,x1,y0,y1,inter_func,out",
     [
@@ -92,6 +107,7 @@ def test_interpolate(x_cur, x0, x1, y0, y1, inter_func, out):
     assert abs(out - interpolated) < 0.01
 
 
+@pytest.mark.unit
 def test_getattr_chain():
     base = SimpleNamespace()
     base.a = None
@@ -123,6 +139,7 @@ def test_getattr_chain():
         getattr_chain(base, "b.d.dne")
 
 
+@pytest.mark.unit
 def test_DisableQuantization():
     model = torch.nn.Linear(1, 1)
     with DisableQuantization(model):
@@ -130,9 +147,12 @@ def test_DisableQuantization():
     assert model.quantization_enabled
 
 
+@pytest.mark.unit
 def test_calibration_forward_context():
-    model = torch.nn.Linear(1, 1)
-    model.config = SimpleNamespace()
+    class DummyModel(PreTrainedModel):
+        config_class = PretrainedConfig
+
+    model = DummyModel(PretrainedConfig())
     model.config.use_cache = True
     model.train()
 
@@ -143,3 +163,43 @@ def test_calibration_forward_context():
     assert torch.is_grad_enabled()
     assert model.config.use_cache
     assert model.training
+
+
+@pytest.mark.unit
+def test_patch_attr():
+    # patch, original value
+    obj = SimpleNamespace()
+    obj.attribute = "original"
+    with patch_attr(obj, "attribute", "patched"):
+        assert obj.attribute == "patched"
+        obj.attribute = "modified"
+    assert obj.attribute == "original"
+
+    # patch, no original attribute
+    obj = SimpleNamespace()
+    with patch_attr(obj, "attribute", "patched"):
+        assert obj.attribute == "patched"
+        obj.attribute = "modified"
+    assert not hasattr(obj, "attribute")
+
+
+@requires_gpu
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "model_cls,model_stub",
+    [
+        (MllamaForConditionalGeneration, "meta-llama/Llama-3.2-11B-Vision-Instruct"),
+        (AutoModelForCausalLM, "nm-testing/llama2.c-stories15M"),
+    ],
+)
+def test_disable_cache(model_cls, model_stub):
+    with skip_weights_download(model_cls):
+        model = model_cls.from_pretrained(model_stub, device_map="cuda")
+    inputs = {key: value.to(model.device) for key, value in model.dummy_inputs.items()}
+
+    with disable_cache(model):
+        output = model(**inputs)
+        assert output.past_key_values is None
+
+    output = model(**inputs)
+    assert output.past_key_values is not None

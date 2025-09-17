@@ -40,9 +40,7 @@ Load the model using `AutoModelForCausalLM` for handling quantized saving and lo
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
 MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID, device_map="auto", torch_dtype="auto",
-)
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 ```
 
@@ -62,8 +60,8 @@ NUM_CALIBRATION_SAMPLES=512
 MAX_SEQUENCE_LENGTH=2048
 
 # Load dataset.
-ds = load_dataset("HuggingFaceH4/ultrachat_200k", split="train_sft")
-ds = ds.shuffle(seed=42).select(range(NUM_CALIBRATION_SAMPLES))
+ds = load_dataset("HuggingFaceH4/ultrachat_200k", split=f"train_sft[:{NUM_CALIBRATION_SAMPLES}]")
+ds = ds.shuffle(seed=42)
 
 # Preprocess the data into the format the model is trained with.
 def preprocess(example):
@@ -101,7 +99,7 @@ oneshot(
 )
 
 # Save to disk compressed.
-SAVE_DIR = MODEL_ID.split("/")[1] + "-W4A16-G128"
+SAVE_DIR = MODEL_ID.rstrip("/").split("/")[-1] + "-W4A16-G128"
 model.save_pretrained(SAVE_DIR, save_compressed=True)
 tokenizer.save_pretrained(SAVE_DIR)
 ```

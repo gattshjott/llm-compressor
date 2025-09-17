@@ -1,10 +1,10 @@
+import os
 import shutil
 import tempfile
 import unittest
 
 import torch
 from compressed_tensors.linear.compressed_linear import CompressedLinear
-from compressed_tensors.quantization.utils import iter_named_leaf_modules
 from parameterized import parameterized_class
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from transformers.utils.quantization_config import CompressedTensorsConfig
@@ -27,7 +27,6 @@ class Test_Decompressed_Linear_Uncompressed_Linear(unittest.TestCase):
         AutoModelForCausalLM decompression
 
     AutoModelForCausalLM decompression diagram flow https://tinyurl.com/2ynb6wbu
-
     """
 
     compressed_model_stub = None
@@ -68,10 +67,6 @@ class Test_Decompressed_Linear_Uncompressed_Linear(unittest.TestCase):
         decompressed_device = self.decompressed_model.device
         uncompressed_device = self.uncompressed_model.device
 
-        # overwrite weights in cpu to cuda
-        self.decompressed_model = self.decompressed_model.to(decompressed_device)
-        self.uncompressed_model = self.uncompressed_model.to(uncompressed_device)
-
         inputs = self.tokenizer(SAMPLE_INPUT, return_tensors="pt", padding=True).to(
             decompressed_device
         )
@@ -87,10 +82,19 @@ class Test_Decompressed_Linear_Uncompressed_Linear(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        shutil.rmtree(cls.test_dir)
+        if os.path.isdir(cls.test_dir):
+            shutil.rmtree(cls.test_dir)
+
+        if hasattr(cls, "decompressed_model") and cls.decompressed_model is not None:
+            cls.decompressed_model.cpu()
+        if hasattr(cls, "uncompressed_model") and cls.uncompressed_model is not None:
+            cls.uncompressed_model.cpu()
         del cls.decompressed_model
         del cls.uncompressed_model
+        del cls.tokenizer
+
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()
 
 
 @requires_gpu
@@ -135,9 +139,7 @@ class Test_Compressed_CompressedLinear_Decompressed_Linear(unittest.TestCase):
 
     def test_compressed_linear_modules_exist(self):
         compressed_linear_counts = 0
-        for _, submodule in iter_named_leaf_modules(
-            self.compressed_model,
-        ):
+        for submodule in self.compressed_model.modules():
             if isinstance(submodule, CompressedLinear):
                 compressed_linear_counts += 1
 
@@ -153,10 +155,6 @@ class Test_Compressed_CompressedLinear_Decompressed_Linear(unittest.TestCase):
 
         decompressed_device = self.decompressed_model.device
         compressed_device = self.compressed_model.device
-
-        # overwrite weights in cpu to cuda
-        self.decompressed_model = self.decompressed_model.to(decompressed_device)
-        self.compressed_model = self.compressed_model.to(compressed_device)
 
         inputs = self.tokenizer(SAMPLE_INPUT, return_tensors="pt", padding=True).to(
             decompressed_device
@@ -176,7 +174,16 @@ class Test_Compressed_CompressedLinear_Decompressed_Linear(unittest.TestCase):
 
     @classmethod
     def tearDownClass(cls):
-        shutil.rmtree(cls.test_dir)
+        if os.path.isdir(cls.test_dir):
+            shutil.rmtree(cls.test_dir)
+
+        if hasattr(cls, "decompressed_model") and cls.decompressed_model is not None:
+            cls.decompressed_model.cpu()
+        if hasattr(cls, "compressed_model") and cls.compressed_model is not None:
+            cls.compressed_model.cpu()
         del cls.decompressed_model
         del cls.compressed_model
+        del cls.tokenizer
+
         torch.cuda.empty_cache()
+        torch.cuda.synchronize()

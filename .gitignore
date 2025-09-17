@@ -23,6 +23,8 @@ llmcompressor/pruned
 tensorboard/*
 onnx/*
 repos/*
+# managed by setuptools-scm
+/src/llmcompressor/version.py
 
 ### Python template
 # Byte-compiled / optimized / DLL files
@@ -51,6 +53,7 @@ wheels/
 .installed.cfg
 *.egg
 MANIFEST
+.cache/*
 
 # PyInstaller
 #  Usually these files are written by a python script from a template
@@ -90,9 +93,6 @@ instance/
 # Scrapy stuff:
 .scrapy
 
-# Sphinx documentation
-docs/_build/
-
 # PyBuilder
 target/
 
@@ -126,6 +126,7 @@ venv.bak/
 
 # mkdocs documentation
 /site
+docs/.cache/
 
 # mypy
 .mypy_cache/

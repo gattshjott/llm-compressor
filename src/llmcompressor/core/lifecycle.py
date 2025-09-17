@@ -12,13 +12,7 @@ from loguru import logger
 
 from llmcompressor.core.events import Event, EventType
 from llmcompressor.core.state import State
-from llmcompressor.modifiers import StageModifiers
-from llmcompressor.recipe import (
-    RecipeArgsInput,
-    RecipeContainer,
-    RecipeInput,
-    RecipeStageInput,
-)
+from llmcompressor.recipe import Recipe, RecipeArgsInput, RecipeInput, RecipeStageInput
 
 __all__ = ["CompressionLifecycle"]
 
@@ -30,15 +24,14 @@ class CompressionLifecycle:
 
     :param state: The current state of the compression process
     :type state: Optional[State]
-    :param recipe_container: The container for the compression recipe
-    :type recipe_container: RecipeContainer
+    :param recipe: The compression recipe
+    :type recipe: Recipe
     :param modifiers: The list of stage modifiers
     :type modifiers: List[StageModifiers]
     """
 
     state: State = field(default_factory=State)
-    recipe_container: RecipeContainer = field(default_factory=RecipeContainer)
-    modifiers: List[StageModifiers] = field(default_factory=list)
+    recipe: Recipe = field(default_factory=Recipe)
 
     initialized_: bool = False
     finalized: bool = False
@@ -65,7 +58,7 @@ class CompressionLifecycle:
         """
         logger.debug("Resetting compression lifecycle")
 
-        for mod in self.modifiers:
+        for mod in self.recipe.modifiers:
             if not mod.initialized or mod.finalized:
                 continue
             try:
@@ -91,17 +84,23 @@ class CompressionLifecycle:
         :return: List of data returned from initialization of modifiers
         :rtype: List[Any]
         """
+
         self.state.update(**kwargs)
         if self.initialized_:  # TODO: do not initialize twice
             return
 
         logger.debug("Initializing compression lifecycle")
-        self.recipe_container.append(recipe, recipe_stage, recipe_args)
-        self.modifiers = self.recipe_container.get_modifiers()
-        self._set_model_layer_prefix()
+        if not recipe:
+            self.recipe = Recipe()
+        else:
+            self.recipe = Recipe.create_instance(
+                path_or_modifiers=recipe, target_stage=recipe_stage
+            )
+            if recipe_args:
+                self.recipe.args = {**recipe_args}
 
         mod_data = []
-        for mod in self.modifiers:
+        for mod in self.recipe.modifiers:
             data = mod.initialize(state=self.state, **kwargs)
             logger.debug("Initialized modifier: {}", mod)
             if data is not None:
@@ -109,7 +108,8 @@ class CompressionLifecycle:
 
         self.initialized_ = True
         logger.info(
-            "Compression lifecycle initialized for {} modifiers", len(self.modifiers)
+            "Compression lifecycle initialized for {} modifiers",
+            len(self.recipe.modifiers),
         )
 
         return mod_data
@@ -133,18 +133,17 @@ class CompressionLifecycle:
 
         logger.debug("Finalizing compression lifecycle")
         mod_data = []
-        for mod in self.modifiers:
+        for mod in self.recipe.modifiers:
             data = mod.finalize(state=self.state, **kwargs)
             logger.debug("Finalized modifier: {}", mod)
             if data is not None:
                 mod_data.append(data)
 
         self.finalized = True
-        applied_stage_names = [mod.unique_id for mod in self.modifiers if mod.applied]
-        self.recipe_container.update_applied_stages(applied_stage_names)
 
         logger.info(
-            "Compression lifecycle finalized for {} modifiers", len(self.modifiers)
+            "Compression lifecycle finalized for {} modifiers",
+            len(self.recipe.modifiers),
         )
 
         return mod_data
@@ -201,7 +200,7 @@ class CompressionLifecycle:
 
         event = Event(type_=event_type)
         mod_data = []
-        for mod in self.modifiers:
+        for mod in self.recipe.modifiers:
             data = mod.update_event(state=self.state, event=event, **kwargs)
             logger.debug("Updated event with modifier: {}", mod)
             if data is not None:
@@ -229,16 +228,3 @@ class CompressionLifecycle:
         if valid:
             self._last_event_type = event_type
         return valid
-
-    def _set_model_layer_prefix(self):
-        compiled_recipe = self.recipe_container.compiled_recipe
-        if (
-            compiled_recipe is None
-            or (metadata := compiled_recipe.metadata) is None
-            or (model_metadata := metadata.target_model) is None
-        ):
-            return False
-
-        self.state.model.layer_prefix = model_metadata.layer_prefix
-        logger.debug("Model layer prefix set to {}", self.state.model.layer_prefix)
-        return True

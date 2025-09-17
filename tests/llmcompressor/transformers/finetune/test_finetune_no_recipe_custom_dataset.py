@@ -40,7 +40,6 @@ class TestFinetuneNoRecipeCustomDataset(unittest.TestCase):
             recipe=None,
             num_train_epochs=self.num_train_epochs,
             concatenate_data=concatenate_data,
-            oneshot_device=self.device,
             text_column="text",
             dataset_path=dataset_path,
             preprocessing_func=preprocessing_func,
@@ -107,7 +106,8 @@ class TestFinetuneNoRecipeCustomDataset(unittest.TestCase):
         return mock_filepath  # Return the file path
 
     def tearDown(self):
-        shutil.rmtree(self.output)
+        if os.path.isdir(self.output):
+            shutil.rmtree(self.output)
 
 
 @pytest.mark.integration

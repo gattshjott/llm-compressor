@@ -22,7 +22,6 @@ class TestLMHead(unittest.TestCase):
         self.kwargs = {
             "sparsity": 0.5,
             "block_size": 128,
-            "quantize": False,
             "targets": [
                 "model.layers.0",
                 "model.layers.1",
@@ -44,7 +43,8 @@ class TestLMHead(unittest.TestCase):
 
         state = State()
         state.update(model=self.model, device=self.device, calib_data=self.dataloader)
-        modifier.on_initialize(state)
+        modifier.initialize(state)
+        modifier.on_start(state, None)
 
         assert len(self.model.lm_head._forward_hooks) <= 0
 
@@ -56,7 +56,8 @@ class TestLMHead(unittest.TestCase):
 
         state = State()
         state.update(model=self.model, device=self.device, calib_data=self.dataloader)
-        modifier.on_initialize(state)
+        modifier.initialize(state)
+        modifier.on_start(state, None)
 
         assert len(self.model.lm_head._forward_hooks) == 1
 

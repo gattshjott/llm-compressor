@@ -1,13 +1,24 @@
 name: Test Checks (Transformers)
 on:
   pull_request:
-    branches: main
+    branches: [ main, 'release/*' ]
     types: [ labeled, synchronize ]
   push:
-    branches: main
+    branches: [ main, 'release/*' ]
+  workflow_dispatch:
+    inputs:
+      code_coverage:
+        description: if enabled, code coverage metrics will be collected during the test run
+        type: boolean
+        default: false
 
 env:
   CADENCE: "commit"
+  HF_TOKEN: ${{ secrets.HF_TOKEN_READ }}
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   detect-changes:
@@ -51,19 +62,29 @@ jobs:
         with:
           python-version: '3.9'
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
       - name: "⚙️ Install dependencies"
         run: pip3 install -U pip setuptools && pip3 install .[dev]
       - uses: actions/checkout@v4
         with:
           repository: "neuralmagic/compressed-tensors"
           path: "compressed-tensors"
+          fetch-depth: 0
+          fetch-tags: true
       - name: "⚙️ Install compressed-tensors dependencies"
         id: install
         run: |
-          pip3 uninstall -y compressed-tensors compressed-tensors-nightly
-          pip3 install ./compressed-tensors/
+          pip3 uninstall -y compressed-tensors
+          export GIT_CEILING_DIRECTORIES="$(pwd)"
+          cd compressed-tensors
+          BUILD_TYPE=nightly pip3 install .
       - name: "Clean compressed-tensors directory"
         run: rm -r compressed-tensors/
+      - name: "⚙️ Prepare code coverage"
+        if: inputs.code_coverage
+        uses: ./.github/actions/prepare-code-coverage
       - name: "🔬 Running transformers tests"
         if: (success() || failure()) && steps.install.outcome == 'success'
         run: |
@@ -80,11 +101,30 @@ jobs:
         if: (success() || failure()) && steps.install.outcome == 'success'
         run: |
           pytest -v tests/llmcompressor/transformers/oneshot
-      - name: Running Sparsification Tests
-        if: (success() || failure()) && steps.install.outcome == 'success'
-        run: |
-          pytest tests/llmcompressor/transformers/sparsification -v
       - name: Running OBCQ Tests
         if: (success() || failure()) && steps.install.outcome == 'success'
         run: |
           pytest -v tests/llmcompressor/transformers/obcq
+      - name: Running Tracing Tests
+        if: (success() || failure()) && steps.install.outcome == 'success'
+        run: |
+          pytest -v tests/llmcompressor/transformers/tracing
+      - name: Running KV Cache Tests
+        if: (success() || failure()) && steps.install.outcome == 'success'
+        run: |
+          pytest -v tests/llmcompressor/transformers/kv_cache
+      - name: "Upload coverage report"
+        if: (success() || failure()) && inputs.code_coverage
+        uses: actions/upload-artifact@v4
+        with:
+          name: transformers-tests-coverage-results
+          path: |
+            .coverage
+            coverage-html
+            coverage.json
+          include-hidden-files: true
+          retention-days: 5
+      - name: "Report coverage"
+        if: (success() || failure()) && inputs.code_coverage
+        run: |
+          coverage report --data-file=".coverage" --skip-empty --format="markdown" > "$GITHUB_STEP_SUMMARY"

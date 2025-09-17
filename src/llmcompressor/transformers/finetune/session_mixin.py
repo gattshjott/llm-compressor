@@ -170,7 +170,10 @@ class SessionManagerMixIn:
                 "pass a yaml file or string to the `recipe` argument."
             )
 
-        torch.cuda.empty_cache()
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.empty_cache()
+        else:
+            torch.cuda.empty_cache()
 
     def finalize_session(self):
         """
@@ -186,7 +189,10 @@ class SessionManagerMixIn:
         logger.info("Finalized LLM Compressor session")
         model = get_session_model()
         self.model = model
-        torch.cuda.empty_cache()
+        if hasattr(torch, "xpu") and torch.xpu.is_available():
+            torch.xpu.empty_cache()
+        else:
+            torch.cuda.empty_cache()
 
     def create_optimizer(self):
         """
@@ -270,7 +276,7 @@ class SessionManagerMixIn:
         model: Module,
         inputs: Dict[str, Any],
         return_outputs: bool = False,
-        num_items_in_batch: Optional[int] = None,
+        num_items_in_batch: Optional[torch.Tensor] = None,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, Any]]:
         """
         Override for the compute_loss to factor trigger callbacks and filter columns
@@ -279,6 +285,7 @@ class SessionManagerMixIn:
         :param inputs: the inputs to pass through the model for calculating the loss
         :param return_outputs: True to return the outputs with the loss,
             False otherwise
+        :param num_items_in_batch: the number of items which contribute to loss
         :return: the resulting loss if not return_outputs, otherwise a tuple
             containing the loss and the model's outputs
         """
@@ -358,7 +365,13 @@ class SessionManagerMixIn:
 
         return output
 
-    def save_model(self, output_dir: str, _internal_call: bool = False):
+    # TODO: support all save args, not just skip_sparsity_compression_stats
+    def save_model(
+        self,
+        output_dir: str,
+        _internal_call: bool = False,
+        skip_sparsity_compression_stats: Optional[bool] = True,
+    ):
         """
         Override of the save_model function and expects it to exist in the parent.
         Calls into super() to save the model and additionally saves any recipes
@@ -382,15 +395,20 @@ class SessionManagerMixIn:
             self.model.prepare_for_save()  # TODO: move to finalize
 
         # save checkpoint
+        # note that skip_sparsity_compression_stats
+        # is True by default to avoid high runtime cost
         self.save_state()
         if self.accelerator.is_main_process:
             processor = getattr(self, "processing_class", self.tokenizer)
+            # TODO: need to port over all saving parameters so that all
+            # checkpoints are saved in the same way
             save_checkpoint(
                 output_dir,
                 model=self.model,
                 processor=processor,
                 save_safetensors=self.args.save_safetensors,
                 save_compressed=self.model_args.save_compressed,
+                skip_sparsity_compression_stats=skip_sparsity_compression_stats,
             )
         self.accelerator.wait_for_everyone()
 

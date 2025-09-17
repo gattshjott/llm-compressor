@@ -1,3 +1,4 @@
+import os
 import shutil
 import unittest
 
@@ -35,7 +36,7 @@ class TestOneshotAndFinetuneWithTokenizer(unittest.TestCase):
             self.model,
         )
         model_loaded = AutoModelForCausalLM.from_pretrained(
-            self.model, device_map="auto"
+            self.model, torch_dtype="auto"
         )
 
         dataset_loaded = load_dataset(
@@ -54,7 +55,6 @@ class TestOneshotAndFinetuneWithTokenizer(unittest.TestCase):
             concatenate_data=concatenate_data,
             splits=splits,
             tokenizer=tokenizer,
-            output_dir=self.output,
         )
 
         oneshot_model = oneshot(
@@ -62,12 +62,14 @@ class TestOneshotAndFinetuneWithTokenizer(unittest.TestCase):
             **model_and_data_kwargs,
             stage="test_oneshot_stage",
         )
+
         finetune_model = train(
             run_stages=run_stages,
             model=oneshot_model,
             max_steps=max_steps,
             stage="test_train_stage",
             **model_and_data_kwargs,
+            output_dir=self.output,
         )
 
         input_ids = tokenizer("Hello my name is", return_tensors="pt").input_ids.to(
@@ -77,4 +79,5 @@ class TestOneshotAndFinetuneWithTokenizer(unittest.TestCase):
         print(tokenizer.decode(output[0]))
 
     def tearDown(self):
-        shutil.rmtree(self.output)
+        if os.path.isdir(self.output):
+            shutil.rmtree(self.output)

@@ -1,11 +1,11 @@
 import torch
+import transformers
 from datasets import load_dataset
 from loguru import logger
 from transformers import AutoProcessor
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import GPTQModifier, QuantizationModifier
-from llmcompressor.transformers.tracing import get_model_class
 from tests.test_timer.timer_utils import log_time
 from tests.testing_utils import process_dataset
 
@@ -14,28 +14,21 @@ from tests.testing_utils import process_dataset
 def _load_model_and_processor(
     model: str,
     model_class: str,
-    device: str,
 ):
-    pretrained_model_class = get_model_class(model_class)
-    loaded_model = pretrained_model_class.from_pretrained(
-        model, device_map=device, torch_dtype="auto"
-    )
+    pretrained_model_class = getattr(transformers, model_class)
+    loaded_model = pretrained_model_class.from_pretrained(model, torch_dtype="auto")
     processor = AutoProcessor.from_pretrained(model)
     return loaded_model, processor
 
 
 @log_time
-def _run_oneshot(device: str, **oneshot_kwargs):
-    oneshot(
-        **oneshot_kwargs,
-        oneshot_device=device,
-    )
+def _run_oneshot(**oneshot_kwargs):
+    oneshot(**oneshot_kwargs)
 
 
 def run_oneshot_for_e2e_testing(
     model: str,
     model_class: str,
-    device: str,
     num_calibration_samples: int,
     max_seq_length: int,
     dataset_id: str,
@@ -49,7 +42,7 @@ def run_oneshot_for_e2e_testing(
     oneshot_kwargs = {}
 
     loaded_model, processor = _load_model_and_processor(
-        model=model, model_class=model_class, device=device
+        model=model, model_class=model_class
     )
 
     if dataset_id:
@@ -77,7 +70,10 @@ def run_oneshot_for_e2e_testing(
         # a compatible preset sceme
         if quant_type == "GPTQ":
             oneshot_kwargs["recipe"] = GPTQModifier(
-                targets="Linear", scheme=scheme, ignore=["lm_head"]
+                targets="Linear",
+                scheme=scheme,
+                actorder=None,  # added for consistency with past testing configs
+                ignore=["lm_head"],
             )
         else:
             oneshot_kwargs["recipe"] = QuantizationModifier(
@@ -86,6 +82,6 @@ def run_oneshot_for_e2e_testing(
 
     # Apply quantization.
     logger.info("ONESHOT KWARGS", oneshot_kwargs)
-    _run_oneshot(device=device, **oneshot_kwargs)
+    _run_oneshot(**oneshot_kwargs)
 
     return oneshot_kwargs["model"], processor

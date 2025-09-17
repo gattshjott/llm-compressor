@@ -1,3 +1,4 @@
+import os
 import shutil
 import unittest
 from pathlib import Path
@@ -38,13 +39,11 @@ class TestConsecutiveRuns(unittest.TestCase):
             num_calibration_samples=num_calibration_samples,
             recipe=self.first_recipe,
             output_dir=self.output_first,
-            oneshot_device=self.device,
-            clear_sparse_session=False,
         )
 
         first_model = AutoModelForCausalLM.from_pretrained(
             self.output_first,
-            device_map="auto",
+            torch_dtype="auto",
             quantization_config=self.quantization_config,
         )
 
@@ -55,9 +54,6 @@ class TestConsecutiveRuns(unittest.TestCase):
         assert qat_active(first_model)
 
         session = active_session()
-        session_recipe = session.lifecycle.recipe_container.compiled_recipe
-        stages = [stage.group for stage in session_recipe.stages]
-        self.assertEqual(len(stages), 1)
         session.reset()
 
         # reload saved model and increase sparsity to 0.7
@@ -67,13 +63,12 @@ class TestConsecutiveRuns(unittest.TestCase):
             num_calibration_samples=num_calibration_samples,
             recipe=self.second_recipe,
             output_dir=self.output_second,
-            oneshot_device=self.device,
         )
 
         second_model = AutoModelForCausalLM.from_pretrained(
             self.output_second,
-            device_map="auto",
             quantization_config=self.quantization_config,
+            torch_dtype="auto",
         )
 
         layer_0_sparse = tensor_sparsity(
@@ -94,21 +89,22 @@ class TestConsecutiveRuns(unittest.TestCase):
             list(recipe_data["test_stage_0"].values())[0].keys()
         )
         exp_stage0_modifier_names = [
-            mod.type
-            for mod in Recipe.create_instance(self.first_recipe).stages[0].modifiers
+            mod.__class__.__name__
+            for mod in Recipe.create_instance(self.first_recipe).modifiers
         ]
         stage1_modifier_names = list(
             list(recipe_data["test_stage_1"].values())[0].keys()
         )
         exp_stage1_modifier_names = [
-            mod.type
-            for mod in Recipe.create_instance(self.second_recipe).stages[0].modifiers
+            mod.__class__.__name__
+            for mod in Recipe.create_instance(self.second_recipe).modifiers
         ]
         self.assertEqual(stage0_modifier_names, exp_stage0_modifier_names)
         self.assertEqual(stage1_modifier_names, exp_stage1_modifier_names)
 
     def tearDown(self):
-        shutil.rmtree(self.output)
+        if os.path.isdir(self.output):
+            shutil.rmtree(self.output)
 
 
 @pytest.mark.integration
@@ -131,7 +127,6 @@ class TestConsecutiveRunsSmall(TestConsecutiveRuns):
         self._test_consecutive_runs(tolerance=1e-3)
 
 
-# TODO: @Satrat and @dsikka, revisit if we want these nightly or weekly
 @requires_gpu
 @pytest.mark.integration
 @parameterized_class(parse_params(GPU_CONFIGS_DIRECTORY))
@@ -152,8 +147,7 @@ class TestConsecutiveRunsGPU(TestConsecutiveRuns):
         )
 
         self.model = AutoModelForCausalLM.from_pretrained(
-            self.model,
-            device_map=self.device,
+            self.model, device_map=self.device, torch_dtype="auto"
         )
 
         self.output = "./oneshot_output"
@@ -161,4 +155,4 @@ class TestConsecutiveRunsGPU(TestConsecutiveRuns):
         self.output_second = Path(self.output) / "test_2"
 
     def test_consecutive_runs_gpu(self):
-        self._test_consecutive_runs(tolerance=1e-0, num_calibration_samples=16)
+        self._test_consecutive_runs(tolerance=1e-0)

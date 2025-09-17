@@ -7,6 +7,9 @@ from compressed_tensors.compressors import ModelCompressor
 from parameterized import parameterized_class
 from transformers import AutoConfig
 
+from llmcompressor.transformers.compression.compressed_tensors_utils import (
+    get_model_compressor,
+)
 from tests.testing_utils import parse_params, requires_gpu
 
 CONFIGS_DIRECTORY = "tests/llmcompressor/transformers/finetune/finetune_oneshot_configs"
@@ -26,26 +29,28 @@ class TestOneshotAndFinetune(unittest.TestCase):
         oneshot_args = dict(
             dataset=self.dataset,
             splits=splits,
-            output_dir=self.output,
             recipe=self.recipe,
             num_calibration_samples=64,
-            oneshot_device=self.device,
             dataset_config_name=self.dataset_config_name,
             concatenate_data=self.concat_txt,
-            clear_sparse_session=True,
+            output_dir=self.output,
         )
 
-        train_args = dict(
-            num_train_epochs=self.num_train_epochs,
-            precision="bfloat16",
-            bf16=True,
-        )
         oneshot_model = oneshot(
             model=self.model,
             **oneshot_args,
             stage="test_oneshot_stage",
         )
 
+        compressor = get_model_compressor(model=oneshot_model, save_compressed=True)
+        if compressor is not None:
+            compressor.decompress_model(oneshot_model)
+
+        train_args = dict(
+            num_train_epochs=self.num_train_epochs,
+            precision="bfloat16",
+            bf16=True,
+        )
         train(
             model=oneshot_model,
             **oneshot_args,
@@ -64,15 +69,15 @@ class TestOneshotAndFinetune(unittest.TestCase):
             ).quantization_config
         )
         # model is first sparsified, then finetuned, both should have the same sparsity
-        assert (
-            config_sparse_applied["global_sparsity"]
-            >= config_finetune_applied["global_sparsity"]
+        assert config_sparse_applied["global_sparsity"] == pytest.approx(
+            config_finetune_applied["global_sparsity"], abs=1e-5
         )
 
     def tearDown(self):
         # TODO: we get really nice stats from finetune that we should log
         # stored in results.json
-        shutil.rmtree(self.output)
+        if os.path.isdir(self.output):
+            shutil.rmtree(self.output)
 
 
 @pytest.mark.integration

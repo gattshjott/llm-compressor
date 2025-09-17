@@ -1,25 +1,18 @@
 [build-system]
-requires = ["setuptools", "wheel"]
+requires = ["setuptools", "wheel", "setuptools_scm==8.2.0"]
 build-backend = "setuptools.build_meta"
-
-[tool.black]
-line-length = 88
-target-version = ['py38']
-
-[tool.isort]
-profile = "black"
-skip = ["src/llmcompressor/transformers/tracing/"]
 
 [tool.mypy]
 files = "src/guidellm"
 
 [tool.ruff]
-exclude = ["build", "dist", "env", ".venv", "src/llmcompressor/transformers/tracing/"]
-lint.select = ["E", "F", "W"]
+extend-exclude = ["env", "src/llmcompressor/transformers/tracing/", "src/llmcompressor/version.py"]
+line-length = 88
+lint.select = ["E", "F", "W", "I"]
+lint.extend-ignore = ["E203", "W605"]
 
-[tool.flake8]
-max-line-length = 88
-extend-ignore = 'E203'
+[tool.ruff.lint.isort]
+known-first-party = ["llmcompressor"]
 
 [tool.pytest.ini_options]
 markers = [

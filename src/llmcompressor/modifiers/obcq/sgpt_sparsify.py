@@ -3,9 +3,7 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import transformers
-from compressed_tensors.quantization.lifecycle.forward import forward_quantize
-
-from llmcompressor.utils import getattr_chain
+from loguru import logger
 
 SGPT_PRECISION = torch.float32
 
@@ -69,8 +67,7 @@ def sparsify_weight(
     preserve_sparsity_mask: bool,
 ) -> torch.Tensor:
     """
-    Run pruning and quantization(if applicable) on the layer up to the target
-    sparsity value.
+    Run pruning on the layer up to the target sparsity value.
 
     :param module: module with weight being sparsified
     :param hessian_dict: dictionary containing preaccumulated hessian for sparsification
@@ -87,12 +84,6 @@ def sparsify_weight(
     W = module.weight.clone()
     H = hessians_dict[module]  # unfortunately python does not have a `move` keyword
     del hessians_dict[module]  # so we have to delete the original reference manually
-
-    # if this module is quantized, perform RTN quantization before sparsifying
-    args_loc = "quantization_scheme.weights"
-    weight_quant_args = getattr_chain(module, args_loc, None)
-    if weight_quant_args is not None:
-        W = forward_quantize(module, W, "weight", weight_quant_args)
 
     # standardize shape and dtype
     if isinstance(module, torch.nn.Conv2d):
@@ -118,11 +109,12 @@ def sparsify_weight(
         H = torch.linalg.cholesky(H, upper=True)
         Hinv = H
     except torch._C._LinAlgError:
-        raise torch._C._LinAlgError(
+        logger.warning(
             "Failed to invert hessian due to numerical instability. Consider "
             "increasing SparseGPTModifier.dampening_frac, increasing the number "
             "of calibration samples, or shuffling the calibration dataset"
         )
+        Hinv = H = torch.eye(num_columns, dtype=H.dtype, device=H.device)
 
     # sparsity mask
     # TODO: consider computing sparsity mask in the same way and place as gptq
@@ -216,10 +208,6 @@ def sparsify_weight(
     if isinstance(module, transformers.Conv1D):
         W.transpose_(0, 1)
     W = W.reshape(final_shape).to(final_dtype)
-
-    # perform RTN quantization
-    if weight_quant_args is not None:
-        W = forward_quantize(module, W, "weight", weight_quant_args)
 
     loss = torch.sum(losses).item()
     return loss, W

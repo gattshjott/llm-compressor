@@ -1,2 +1,2 @@
-# flake8: noqa
-from .pipeline import run_pipeline
+# ruff: noqa
+from .pipeline import *

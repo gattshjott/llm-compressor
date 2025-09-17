@@ -6,6 +6,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer
 from llmcompressor import oneshot
 from llmcompressor.modifiers.obcq import SparseGPTModifier
 from llmcompressor.modifiers.quantization import QuantizationModifier
+from llmcompressor.utils import dispatch_for_generation
 
 # Configuration
 MODEL_ID = "meta-llama/Meta-Llama-3-8B-Instruct"
@@ -48,7 +49,7 @@ def get_recipe(fp8_enabled):
             targets=[r"re:model.layers.\d*$"],
         )
     ]
-    save_dir = MODEL_ID.split("/")[1] + "2of4-sparse"
+    save_dir = MODEL_ID.rstrip("/").split("/")[-1] + "2of4-sparse"
 
     if fp8_enabled:
         base_recipe.append(
@@ -58,7 +59,9 @@ def get_recipe(fp8_enabled):
                 scheme="FP8_DYNAMIC",
             )
         )
-        save_dir = MODEL_ID.split("/")[1] + "2of4-W8A8-FP8-Dynamic-Per-Token"
+        save_dir = (
+            MODEL_ID.rstrip("/").split("/")[-1] + "2of4-W8A8-FP8-Dynamic-Per-Token"
+        )
 
         # check that asymmetric quantization is not being used
         q_scheme = base_recipe[1].scheme
@@ -75,17 +78,13 @@ def get_recipe(fp8_enabled):
 args = parse_args()
 
 # Load model and tokenizer
-model = AutoModelForCausalLM.from_pretrained(
-    MODEL_ID, device_map="auto", torch_dtype="auto"
-)
+model = AutoModelForCausalLM.from_pretrained(MODEL_ID, torch_dtype="auto")
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
 
 # Load and preprocess dataset
-ds = (
-    load_dataset(DATASET_ID, split=DATASET_SPLIT)
-    .shuffle(seed=42)
-    .select(range(NUM_CALIBRATION_SAMPLES))
-)
+ds = load_dataset(
+    DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]"
+).shuffle(seed=42)
 ds = ds.map(preprocess)
 ds = ds.map(tokenize, remove_columns=ds.column_names)
 
@@ -103,7 +102,10 @@ oneshot(
 
 # Validate the compressed model
 print("\n========== SAMPLE GENERATION ==============")
-input_ids = tokenizer("Hello my name is", return_tensors="pt").input_ids.to("cuda")
+dispatch_for_generation(model)
+input_ids = tokenizer("Hello my name is", return_tensors="pt").input_ids.to(
+    model.device
+)
 output = model.generate(input_ids, max_new_tokens=100)
 print(tokenizer.decode(output[0]))
 print("==========================================\n")

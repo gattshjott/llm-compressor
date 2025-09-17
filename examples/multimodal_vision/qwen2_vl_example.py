@@ -4,29 +4,25 @@ from io import BytesIO
 import torch
 from datasets import load_dataset
 from qwen_vl_utils import process_vision_info
-from transformers import AutoProcessor
+from transformers import AutoProcessor, Qwen2VLForConditionalGeneration
 
 from llmcompressor import oneshot
 from llmcompressor.modifiers.quantization import GPTQModifier
-from llmcompressor.transformers.tracing import TraceableQwen2VLForConditionalGeneration
+from llmcompressor.utils import dispatch_for_generation
 
 # Load model.
 model_id = "Qwen/Qwen2-VL-2B-Instruct"
-model = TraceableQwen2VLForConditionalGeneration.from_pretrained(
-    model_id,
-    device_map="auto",
-    torch_dtype="auto",
-)
+model = Qwen2VLForConditionalGeneration.from_pretrained(model_id, torch_dtype="auto")
 processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=True)
 
 # Oneshot arguments
 DATASET_ID = "lmms-lab/flickr30k"
-DATASET_SPLIT = {"calibration": "test[:512]"}
+DATASET_SPLIT = "test"
 NUM_CALIBRATION_SAMPLES = 512
 MAX_SEQUENCE_LENGTH = 2048
 
 # Load dataset and preprocess.
-ds = load_dataset(DATASET_ID, split=DATASET_SPLIT)
+ds = load_dataset(DATASET_ID, split=f"{DATASET_SPLIT}[:{NUM_CALIBRATION_SAMPLES}]")
 ds = ds.shuffle(seed=42)
 
 
@@ -69,7 +65,7 @@ def preprocess_and_tokenize(example):
     )
 
 
-ds = ds.map(preprocess_and_tokenize, remove_columns=ds["calibration"].column_names)
+ds = ds.map(preprocess_and_tokenize, remove_columns=ds.column_names)
 
 
 # Define a oneshot data collator for multimodal inputs.
@@ -83,8 +79,7 @@ recipe = [
     GPTQModifier(
         targets="Linear",
         scheme="W4A16",
-        sequential_targets=["Qwen2VLDecoderLayer"],
-        ignore=["lm_head", "re:visual.*"],
+        ignore=["lm_head", "re:visual.*", "re:model.visual.*"],
     ),
 ]
 
@@ -98,10 +93,12 @@ oneshot(
     num_calibration_samples=NUM_CALIBRATION_SAMPLES,
     trust_remote_code_model=True,
     data_collator=data_collator,
+    sequential_targets=["Qwen2VLDecoderLayer"],
 )
 
 # Confirm generations of the quantized model look sane.
 print("========== SAMPLE GENERATION ==============")
+dispatch_for_generation(model)
 messages = [
     {
         "role": "user",
@@ -124,13 +121,13 @@ inputs = processor(
     max_length=MAX_SEQUENCE_LENGTH,
     truncation=True,
     return_tensors="pt",
-).to("cuda")
+).to(model.device)
 output = model.generate(**inputs, max_new_tokens=100)
 print(processor.decode(output[0], skip_special_tokens=True))
 print("==========================================")
 
 
 # Save to disk compressed.
-SAVE_DIR = model_id.split("/")[1] + "-W4A16-G128"
+SAVE_DIR = model_id.rstrip("/").split("/")[-1] + "-W4A16-G128"
 model.save_pretrained(SAVE_DIR, save_compressed=True)
 processor.save_pretrained(SAVE_DIR)

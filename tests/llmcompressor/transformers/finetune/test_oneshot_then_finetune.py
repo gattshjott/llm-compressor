@@ -1,3 +1,4 @@
+import os
 import shutil
 import unittest
 from pathlib import Path
@@ -20,7 +21,7 @@ class TestOneshotThenFinetune(unittest.TestCase):
     def test_oneshot_sparsification_then_finetune(self):
         recipe_str = "tests/llmcompressor/transformers/obcq/recipes/test_tiny2.yaml"
         model = AutoModelForCausalLM.from_pretrained(
-            "nm-testing/llama2.c-stories15M", device_map="auto"
+            "nm-testing/llama2.c-stories15M", torch_dtype="auto"
         )
         dataset = "open_platypus"
         concatenate_data = False
@@ -46,16 +47,27 @@ class TestOneshotThenFinetune(unittest.TestCase):
         # Explictly decompress the model for training using quantization_config
         model = AutoModelForCausalLM.from_pretrained(
             self.output / "oneshot_out",
-            device_map="auto",
+            torch_dtype="auto",
             quantization_config=self.quantization_config,
         )
         distill_teacher = AutoModelForCausalLM.from_pretrained(
-            "nm-testing/llama2.c-stories15M", device_map="auto"
+            "nm-testing/llama2.c-stories15M", torch_dtype="auto"
         )
         dataset = "open_platypus"
         concatenate_data = False
         output_dir = self.output / "finetune_out"
         splits = "train[5%:7%]"
+
+        recipe = """
+        test_stage:
+            pruning_modifiers:
+                ConstantPruningModifier:
+                    targets: ['re:.*q_proj.weight', 're:.*k_proj.weight',
+                    're:.*v_proj.weight', 're:.*o_proj.weight',
+                    're:.*gate_proj.weight', 're:.*up_proj.weight',
+                    're:.*down_proj.weight']
+                    start: 0
+        """
 
         with create_session():
             train(
@@ -64,9 +76,9 @@ class TestOneshotThenFinetune(unittest.TestCase):
                 dataset=dataset,
                 output_dir=output_dir,
                 num_train_epochs=0.05,
-                recipe=recipe_str,
                 concatenate_data=concatenate_data,
                 splits=splits,
+                recipe=recipe,
             )
 
         # test reloading checkpoint and final model
@@ -74,8 +86,11 @@ class TestOneshotThenFinetune(unittest.TestCase):
         # with the saved model
         # Explictly decompress the model for training using quantization_config
         model = AutoModelForCausalLM.from_pretrained(
-            output_dir, device_map="auto", quantization_config=self.quantization_config
+            output_dir,
+            torch_dtype="auto",
+            quantization_config=self.quantization_config,
         )
+
         with create_session():
             train(
                 model=model,
@@ -83,9 +98,9 @@ class TestOneshotThenFinetune(unittest.TestCase):
                 dataset=dataset,
                 output_dir=output_dir,
                 num_train_epochs=0.05,
-                recipe=recipe_str,
                 concatenate_data=concatenate_data,
                 splits=splits,
+                recipe=recipe,
                 resume_from_checkpoint=True,  # use last checkpoint
             )
 
@@ -95,8 +110,7 @@ class TestOneshotThenFinetune(unittest.TestCase):
         )
 
         model = AutoModelForCausalLM.from_pretrained(
-            "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
-            device_map="auto",
+            "TinyLlama/TinyLlama-1.1B-Chat-v1.0", torch_dtype="auto"
         )
         dataset = "open_platypus"
         concatenate_data = False
@@ -120,9 +134,10 @@ class TestOneshotThenFinetune(unittest.TestCase):
         quantization_config = CompressedTensorsConfig(run_compressed=False)
         model = AutoModelForCausalLM.from_pretrained(
             output_dir,
-            device_map="auto",
+            torch_dtype="auto",
             quantization_config=quantization_config,
         )
+
         dataset = "open_platypus"
         concatenate_data = False
         output_dir = self.output / "finetune_out"
@@ -133,7 +148,6 @@ class TestOneshotThenFinetune(unittest.TestCase):
                 model=model,
                 dataset=dataset,
                 output_dir=output_dir,
-                recipe=recipe,
                 concatenate_data=concatenate_data,
                 splits=splits,
                 num_train_epochs=0.05,
@@ -141,14 +155,16 @@ class TestOneshotThenFinetune(unittest.TestCase):
 
         # test reloading checkpoint and final model
         model = AutoModelForCausalLM.from_pretrained(
-            output_dir, device_map="auto", quantization_config=quantization_config
+            output_dir,
+            torch_dtype="auto",
+            quantization_config=quantization_config,
         )
+
         with create_session():
             train(
                 model=model,
                 dataset=dataset,
                 output_dir=output_dir,
-                recipe=recipe,
                 concatenate_data=concatenate_data,
                 splits=splits,
                 num_train_epochs=0.05,
@@ -156,4 +172,5 @@ class TestOneshotThenFinetune(unittest.TestCase):
             )
 
     def tearDown(self):
-        shutil.rmtree(self.output)
+        if os.path.isdir(self.output):
+            shutil.rmtree(self.output)

@@ -1,75 +1,162 @@
-import unittest
+from contextlib import nullcontext
 
 import pytest
+from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme
 
-from llmcompressor.core.events import Event
-from llmcompressor.modifiers.factory import ModifierFactory
-from llmcompressor.modifiers.quantization import QuantizationModifier
-from tests.llmcompressor.modifiers.conf import setup_modifier_factory
+from llmcompressor.modifiers.quantization import GPTQModifier
 
 
-@pytest.mark.unit
-class TestQuantizationRegistered(unittest.TestCase):
-    def setUp(self):
-        setup_modifier_factory()
-        self.kwargs = dict(
-            index=0, group="quantization", start=2.0, end=-1.0, config_groups={}
+@pytest.fixture
+def q_config_kwargs(config_0, config_1):
+    return dict(
+        config_groups=dict(
+            group_0=dict(
+                targets=["Linear"],
+                input_activations=dict(num_bits=8, symmetric=False, strategy="token"),
+                weights=dict(
+                    num_bits=4,
+                    symmetric=True,
+                    strategy="group",
+                    group_size=128,
+                    actorder=config_0,
+                ),
+            ),
+            group_1=dict(
+                targets=["Linear"],
+                input_activations=dict(num_bits=8, symmetric=False, strategy="token"),
+                weights=dict(
+                    num_bits=4,
+                    symmetric=True,
+                    strategy="group",
+                    group_size=128,
+                    actorder=config_1,
+                ),
+            ),
         )
+    )
 
-    def test_quantization_registered(self):
-        quant_obj = ModifierFactory.create(
-            type_="QuantizationModifier",
-            allow_experimental=False,
-            allow_registered=True,
-            **self.kwargs,
+
+@pytest.fixture
+def block_q_config_kwargs():
+    return dict(
+        config_groups=dict(
+            group_block=dict(
+                targets=["Linear"],
+                input_activations=dict(
+                    num_bits=8, symmetric=True, strategy="group", group_size=128
+                ),
+                weights=dict(
+                    num_bits=8,
+                    symmetric=True,
+                    strategy="block",
+                    block_structure=[128, 128],
+                ),
+            ),
         )
+    )
 
-        self.assertIsInstance(quant_obj, QuantizationModifier)
+
+def test_block_strategy_parsing(block_q_config_kwargs):
+    modifier = GPTQModifier(**block_q_config_kwargs)
+    resolved = modifier.resolve_quantization_config()
+    w_scheme = resolved.config_groups["group_block"].weights
+    assert w_scheme.strategy == "block"
+    assert w_scheme.block_structure == [128, 128]
 
 
-@pytest.mark.unit
-class TestEndEpochs(unittest.TestCase):
-    def setUp(self):
-        self.start = 0.0
-        self.scheme = dict(
-            input_activations=dict(num_bits=8, symmetric=True),
-            weights=dict(num_bits=6, symmetric=False),
+@pytest.mark.parametrize(
+    "has_actorder,actorder,config_0,config_1,expected_0,expected_1",
+    [
+        # defaults to "static" if nothing provided
+        (False, "N/A", None, None, "static", "static"),
+        # modifier overrides config if no config provided
+        (True, "static", None, None, "static", "static"),
+        (True, "group", None, None, "group", "group"),
+        (True, None, None, None, None, None),
+        # modifier overrides if config partially matches anyways
+        (True, "group", None, "group", "group", "group"),
+        (True, "group", "group", None, "group", "group"),
+        # modifier errors if explicitly conflicts with config
+        (True, "static", None, "group", "error", "error"),
+        (True, "static", "group", None, "error", "error"),
+        (True, "group", None, "static", "error", "error"),
+        (True, "group", "static", None, "error", "error"),
+        (True, None, "static", None, "error", "error"),
+        # modifier overrides to static if nothing is provided
+        (False, "N/A", None, "static", "static", "static"),
+        (False, "N/A", "static", None, "static", "static"),
+        (False, "N/A", "static", "static", "static", "static"),
+        # modifier does not override set config vaules
+        (False, "N/A", None, "group", "static", "group"),
+        (False, "N/A", "group", None, "group", "static"),
+        (False, "N/A", "group", "group", "group", "group"),
+    ],
+)
+def test_actorder_resolution(
+    has_actorder, actorder, q_config_kwargs, expected_0, expected_1
+):
+    if has_actorder:
+        modifier = GPTQModifier(**q_config_kwargs, actorder=actorder)
+    else:
+        modifier = GPTQModifier(**q_config_kwargs)
+
+    with pytest.raises(ValueError) if expected_0 == "error" else nullcontext():
+        resolved = modifier.resolve_quantization_config()
+
+    if expected_0 != "error":
+        assert resolved.config_groups["group_0"].input_activations.actorder is None
+        assert resolved.config_groups["group_0"].weights.actorder == expected_0
+        assert resolved.config_groups["group_1"].input_activations.actorder is None
+        assert resolved.config_groups["group_1"].weights.actorder == expected_1
+
+
+@pytest.mark.parametrize(
+    "strategies,actorder",
+    [
+        (["group"], None),
+        (["group"], "static"),
+        (["group"], "group"),
+        (["channel", "group"], None),
+        (["channel", "group"], "static"),
+        (["channel", "group"], "group"),
+        (["group", "channel"], None),
+        (["group", "channel"], "static"),
+        (["group", "channel"], "group"),
+    ],
+)
+def test_config_resolution(strategies, actorder):
+    config_groups = {
+        str(index): QuantizationScheme(
+            targets=[],
+            weights=QuantizationArgs(
+                strategy=strategy, group_size=(128 if strategy == "group" else None)
+            ),
         )
+        for index, strategy in enumerate(strategies)
+    }
 
-    def test_end_epochs(self):
-        disable_quant_epoch = None
-        obj_modifier = QuantizationModifier(
-            start=self.start,
-            scheme=self.scheme,
-            disable_quantization_observer_epoch=disable_quant_epoch,
-            config_groups={},
-        )
+    modifier = GPTQModifier(config_groups=config_groups, actorder=actorder)
+    modifier.resolve_quantization_config()
 
-        self.assertEqual(obj_modifier.calculate_disable_observer_epoch(), -1)
+    # validate that actorder was applied
+    for config_group in modifier.config_groups.values():
+        if config_group.weights.strategy == "group":
+            assert config_group.weights.actorder == actorder
 
-        for epoch in range(3):
-            event = Event(steps_per_epoch=1, global_step=epoch)
-            assert not obj_modifier.check_should_disable_observer(event)
 
-        disable_quant_epoch = 3.5
-        obj_modifier = QuantizationModifier(
-            start=self.start,
-            scheme=self.scheme,
-            disable_quantization_observer_epoch=disable_quant_epoch,
-            config_groups={},
-        )
+@pytest.mark.parametrize(
+    "has_actorder,actorder,exp_actorder",
+    [
+        (False, "N/A", "static"),
+        (True, None, None),
+        (True, "static", "static"),
+        (True, "group", "group"),
+    ],
+)
+def test_serialize_actorder(has_actorder, actorder, exp_actorder):
+    if has_actorder:
+        modifier = GPTQModifier(targets=["Linear"], actorder=actorder)
+    else:
+        modifier = GPTQModifier(targets=["Linear"])
 
-        self.assertEqual(
-            obj_modifier.calculate_disable_observer_epoch(), disable_quant_epoch
-        )
-
-        for epoch in range(4):
-            event = Event(steps_per_epoch=1, global_step=epoch)
-            assert not obj_modifier.check_should_disable_observer(event)
-
-        event = Event(steps_per_epoch=1, global_step=4)
-        assert obj_modifier.check_should_disable_observer(event)
-
-        for epoch in range(5, 8):
-            event = Event(steps_per_epoch=1, global_step=epoch)
-            assert obj_modifier.check_should_disable_observer(event)
+    assert modifier.model_dump()["actorder"] == exp_actorder

@@ -4,13 +4,15 @@ Utility / helper functions
 
 import difflib
 import re
+from operator import attrgetter
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
+from compressed_tensors import InternalModule
 from compressed_tensors.quantization.utils import is_module_quantized
-from packaging import version
 from torch.nn import Linear, Module, Parameter
 from torch.nn.modules.conv import _ConvNd
+from transformers import PreTrainedModel
 
 from llmcompressor.core import ModelParameterizedLayer
 from llmcompressor.utils.fsdp.context import (
@@ -52,7 +54,6 @@ __all__ = [
     "set_layer",
     "get_params",
     "get_param",
-    "set_param",
     "get_terminal_layers",
     "get_prunable_layers",
     "get_quantizable_layers",
@@ -60,11 +61,8 @@ __all__ = [
     "get_layers_params",
     "get_matching_layer",
     "get_no_split_params",
+    "get_layer_by_name",
 ]
-
-
-_PARSED_TORCH_VERSION = version.parse(torch.__version__)
-
 
 ALL_TARGET = "__ALL__"
 ALL_PRUNABLE_TARGET = "__ALL_PRUNABLE__"
@@ -162,8 +160,34 @@ def match_layers_params(
     return resolved
 
 
-def get_layers(targets: Union[str, List[str]], module: Module) -> Dict[str, Module]:
-    return match_layers_params(targets, module)
+def get_layers(
+    targets: Union[str, List[str]],
+    module: Module,
+    exclude_internal_modules: bool = False,
+) -> Dict[str, Module]:
+    """
+    Get layers (also known as submodules) of module based on targets
+
+    :param targets: names or regexes to search for
+        Can be regex, e.g. "re:.*input_layernorm$" to find all layers
+        in module whose names end in string "input_layernorm"
+    :param module: Parent module in which to search for targets
+    :param exclude_internal_modules: If True, don't include internal
+        modules added by llm-compressor, e.g. Observers and Transforms.
+        Defaults to False to maintain backward compatibility
+
+    :return: dict of {layer name -> module} of all layers in module
+        that match targets
+    """
+    layer_dict = match_layers_params(targets, module)
+    if exclude_internal_modules:
+        layer_dict = {
+            name: layer
+            for name, layer in layer_dict.items()
+            if not isinstance(layer, InternalModule)
+        }
+
+    return layer_dict
 
 
 def get_layer(target: str, module: Module) -> Tuple[str, Module]:
@@ -204,15 +228,6 @@ def get_param(target: str, module: Module) -> Tuple[str, Parameter]:
     name, param = next(iter(params.items()))
 
     return name, param
-
-
-def set_param(target: str, param: Parameter, module: Module) -> Parameter:
-    layer_name, param_name = target.rsplit(".", 1)
-    layer = get_layer(layer_name, module)[1]
-    old_param = getattr(layer, param_name)
-    setattr(layer, param_name, param)
-
-    return old_param
 
 
 def get_terminal_layers(module: Module) -> Dict[str, Module]:
@@ -323,7 +338,7 @@ def get_matching_layer(
     return match
 
 
-def get_no_split_params(module: Module) -> Union[str, List[str]]:
+def get_no_split_params(model: PreTrainedModel) -> Union[str, List[str]]:
     """
     Get list of module classes that shouldn't be split when sharding. For
     Hugging Face Transformer models, this is the decoder layer type. For other
@@ -334,7 +349,20 @@ def get_no_split_params(module: Module) -> Union[str, List[str]]:
     # importing here to avoid circular import
     from llmcompressor.utils.fsdp.helpers import maybe_get_wrapped
 
-    model = maybe_get_wrapped(module)
-    if hasattr(model, "_no_split_modules"):
-        return model._no_split_modules
-    return ALL_TARGET
+    model = maybe_get_wrapped(model)
+    no_split_modules = model._get_no_split_modules("auto")
+    if len(no_split_modules) <= 0:
+        return ALL_TARGET
+
+    return no_split_modules
+
+
+# https://discuss.pytorch.org/t/how-to-access-to-a-layer-by-module-name/83797/8
+def get_layer_by_name(layer_name: str, module: Module) -> Module:
+    """
+    Get the layer of a module by name.
+    :param layer_name: Name of the layer to find.
+    :param module: Module in which to search for layer_name
+    :return: Module, the layer with name layer_name
+    """
+    return attrgetter(layer_name)(module)
